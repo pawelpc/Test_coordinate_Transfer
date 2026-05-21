@@ -284,6 +284,203 @@ function finalisePoint(name, axes, label) {
 }
 
 // ============================================================
+// Linear algebra helpers (using math.js)
+// ============================================================
+// Convert a math.js Matrix or nested array to plain 2D JS array
+function toArr2D(M) {
+  if (M && typeof M.toArray === 'function') return M.toArray();
+  return M;
+}
+function toArr1D(v) {
+  if (v && typeof v.toArray === 'function') return v.toArray();
+  return v;
+}
+
+// SVD for a real square (or general) matrix via eigendecomposition of A^T A.
+// Returns U, sigma (array of singular values, descending), V such that A = U * diag(sigma) * V^T.
+// Suitable for small matrices like our 3x3 cross-covariance.
+function svdViaEigs(A) {
+  const At = math.transpose(A);
+  const AtA = math.multiply(At, A); // n x n symmetric PSD
+  const n = (math.size(A).valueOf())[1];
+
+  const eig = math.eigs(AtA);
+  const rawVals = toArr1D(eig.values).map(v => (typeof v === 'object' && v.re !== undefined) ? v.re : Number(v));
+
+  // Build eigenvectors as columns; math.eigs returns either `eigenvectors`
+  // array of {value, vector} OR a `vectors` matrix whose columns are the eigenvectors.
+  let vecsCols = [];
+  if (Array.isArray(eig.eigenvectors)) {
+    vecsCols = eig.eigenvectors.map(e => toArr1D(e.vector).map(Number));
+  } else if (eig.vectors) {
+    const M = toArr2D(eig.vectors);
+    // columns
+    for (let j = 0; j < n; j++) {
+      vecsCols.push(M.map(row => Number(row[j])));
+    }
+  } else {
+    throw new Error('Unexpected math.eigs return shape');
+  }
+
+  // Pair (eigenvalue, eigenvector) and sort descending by eigenvalue
+  const pairs = rawVals.map((v, i) => ({ val: v, vec: vecsCols[i] }));
+  pairs.sort((a, b) => b.val - a.val);
+
+  const sigma = pairs.map(p => Math.sqrt(Math.max(0, p.val)));
+  // V columns are the sorted eigenvectors (normalised; math.eigs returns unit-length)
+  const Vcols = pairs.map(p => normaliseVec(p.vec));
+  const V = transpose2D(Vcols); // V is n x n, with eigenvectors as columns
+
+  // U columns: u_j = A v_j / sigma_j
+  const Ucols = [];
+  for (let j = 0; j < n; j++) {
+    const vj = Vcols[j];
+    const Av = matVec(toArr2D(A), vj);
+    if (sigma[j] > 1e-12) {
+      Ucols.push(Av.map(x => x / sigma[j]));
+    } else {
+      // Degenerate — fill with zero column; for our use-case sigma should be > 0
+      Ucols.push(Av.map(() => 0));
+    }
+  }
+  const U = transpose2D(Ucols);
+
+  return { U, sigma, V };
+}
+
+function normaliseVec(v) {
+  const n = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
+  if (n < 1e-15) return v.slice();
+  return v.map(x => x / n);
+}
+
+function transpose2D(M) {
+  const rows = M.length, cols = M[0].length;
+  const T = [];
+  for (let i = 0; i < cols; i++) {
+    T.push([]);
+    for (let j = 0; j < rows; j++) T[i].push(M[j][i]);
+  }
+  return T;
+}
+
+function matVec(M, v) {
+  const rows = M.length;
+  const out = new Array(rows).fill(0);
+  for (let i = 0; i < rows; i++) {
+    let s = 0;
+    for (let j = 0; j < v.length; j++) s += M[i][j] * v[j];
+    out[i] = s;
+  }
+  return out;
+}
+
+function det3(M) {
+  return M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+       - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+       + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+}
+
+// ============================================================
+// Similarity transform (Umeyama, SVD-based)
+// ============================================================
+// Inputs:
+//   globalPts: array of 3-arrays [E, N, Elev] in METERS
+//   machinePts: array of 3-arrays [X, Y, Z] in MM
+// Returns: { s (scalar), R (3x3 array, rotation), t (3-array, mm) }
+// such that machine ≈ s * R * global + t
+function computeSimilarityTransform(globalPts, machinePts) {
+  const n = globalPts.length;
+  if (n !== machinePts.length) throw new Error('Point count mismatch');
+  if (n < 3) throw new Error('Need at least 3 calibration points');
+
+  // Centroids
+  const pBar = [0, 0, 0], qBar = [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 3; k++) {
+      pBar[k] += globalPts[i][k];
+      qBar[k] += machinePts[i][k];
+    }
+  }
+  for (let k = 0; k < 3; k++) { pBar[k] /= n; qBar[k] /= n; }
+
+  // Centered point matrices: P (3xn), Q (3xn). Columns are points.
+  // Also compute Σ ||p_i'||²
+  let varP = 0;
+  const P = [[], [], []], Q = [[], [], []];
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 3; k++) {
+      const pi = globalPts[i][k] - pBar[k];
+      const qi = machinePts[i][k] - qBar[k];
+      P[k].push(pi);
+      Q[k].push(qi);
+      varP += pi * pi;
+    }
+  }
+  // Note: varP currently sums over all coords AND all points (the trace of P'^T P').
+
+  // Cross-covariance H = P · Q^T (3x3) per the brief.
+  const H = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      let s = 0;
+      for (let i = 0; i < n; i++) s += P[r][i] * Q[c][i];
+      H[r][c] = s;
+    }
+  }
+
+  // SVD of H
+  const { U, sigma, V } = svdViaEigs(H);
+
+  // Reflection correction
+  const VUt = math.multiply(V, math.transpose(U));
+  const d = det3(toArr2D(VUt)) > 0 ? 1 : -1;
+  const S_diag = [1, 1, d];
+
+  // R = V · diag(S) · U^T
+  const Ut = transpose2D(U);
+  const VS = V.map(row => row.map((val, j) => val * S_diag[j]));
+  const R = math.multiply(VS, Ut);
+  const Rarr = toArr2D(R);
+
+  // Scale: s = trace(diag(S) · Σ) / Σ ||p'||²
+  //       = (σ1 + σ2 + d·σ3) / varP
+  const trDS = sigma[0] * S_diag[0] + sigma[1] * S_diag[1] + sigma[2] * S_diag[2];
+  const sScale = trDS / varP;
+
+  // Translation: t = qBar - s · R · pBar
+  const RpBar = matVec(Rarr, pBar);
+  const tVec = [qBar[0] - sScale * RpBar[0],
+                qBar[1] - sScale * RpBar[1],
+                qBar[2] - sScale * RpBar[2]];
+
+  return { s: sScale, R: Rarr, t: tVec };
+}
+
+// Apply similarity transform: q = s * R * p + t
+function applySimilarity(s, R, t, p) {
+  const Rp = matVec(R, p);
+  return [s * Rp[0] + t[0], s * Rp[1] + t[1], s * Rp[2] + t[2]];
+}
+
+// Compute residuals per calibration point.
+// Returns array of { name, predicted: [x,y,z], actual: [x,y,z], error: [dx,dy,dz], errMag } and an rms summary.
+function computeResiduals(s, R, t, globalPts, machinePts, labels) {
+  const rows = [];
+  let sumSq = 0;
+  for (let i = 0; i < globalPts.length; i++) {
+    const pred = applySimilarity(s, R, t, globalPts[i]);
+    const act = machinePts[i];
+    const err = [act[0] - pred[0], act[1] - pred[1], act[2] - pred[2]];
+    const mag = Math.sqrt(err[0] * err[0] + err[1] * err[1] + err[2] * err[2]);
+    sumSq += mag * mag;
+    rows.push({ name: labels[i], predicted: pred, actual: act, error: err, errMag: mag });
+  }
+  const rms = Math.sqrt(sumSq / globalPts.length);
+  return { rows, rms };
+}
+
+// ============================================================
 // File handling / UI plumbing
 // ============================================================
 const dropZone = document.getElementById('dropZone');
@@ -344,10 +541,42 @@ function logParsed(p) {
 }
 
 // ============================================================
-// Processing (placeholder — will be filled in later milestones)
+// Processing
 // ============================================================
 function runProcessing() {
-  logStatus('Processing not yet implemented in this milestone.', 'err');
+  if (!g_parsed) { logStatus('No parsed data', 'err'); return; }
+  try {
+    const p = g_parsed;
+
+    // Build calibration point lists (Global in meters, Machine in mm)
+    const n = p.stage1.colLabels.length;
+    const globalPts = [], machinePts = [];
+    for (let i = 0; i < n; i++) {
+      globalPts.push([p.stage1.uts.east[i], p.stage1.uts.north[i], p.stage1.uts.elev[i]]);
+      machinePts.push([p.stage1.machine.x[i], p.stage1.machine.y[i], p.stage1.machine.z[i]]);
+    }
+
+    logStatus(`Computing similarity transform from ${n} calibration points...`);
+    const sim = computeSimilarityTransform(globalPts, machinePts);
+    logStatus(`Scale factor s = ${sim.s.toFixed(6)} (expected ≈ 1000)`, 'ok');
+    logStatus(`Rotation R (rows):`);
+    logStatus(`  [${sim.R[0].map(v => v.toFixed(6)).join(', ')}]`);
+    logStatus(`  [${sim.R[1].map(v => v.toFixed(6)).join(', ')}]`);
+    logStatus(`  [${sim.R[2].map(v => v.toFixed(6)).join(', ')}]`);
+    logStatus(`det(R) = ${det3(sim.R).toFixed(6)} (should be +1)`);
+    logStatus(`Translation t = [${sim.t.map(v => v.toFixed(3)).join(', ')}] mm`);
+
+    const res = computeResiduals(sim.s, sim.R, sim.t, globalPts, machinePts, p.stage1.colLabels);
+    logStatus(`RMS residual: ${res.rms.toFixed(3)} mm  (max ${Math.max(...res.rows.map(r => r.errMag)).toFixed(3)})`, 'ok');
+    for (const r of res.rows) {
+      logStatus(`  ${r.name}: err = ${r.errMag.toFixed(3)} mm`);
+    }
+
+    g_results = { sim, residuals: res };
+  } catch (err) {
+    logStatus('Processing error: ' + err.message, 'err');
+    console.error(err);
+  }
 }
 
 function downloadOutput() {
