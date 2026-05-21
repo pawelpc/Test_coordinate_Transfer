@@ -27,6 +27,8 @@
   th, td { border: 1px solid #cbd2d9; padding: 4px 8px; text-align: right; }
   th { background: #f0f4f8; }
   td:first-child, th:first-child { text-align: left; }
+  tr.outlier td { background: #fdecea; }
+  tr.outlier td:last-child { color: #b00020; }
   .hidden { display: none; }
 </style>
 </head>
@@ -864,10 +866,15 @@ function renderResiduals(res) {
     'Actual X', 'Actual Y', 'Actual Z',
     'Err X', 'Err Y', 'Err Z',
     '|Err| (mm)'];
+  // Flag rows whose error magnitude exceeds 3× the RMS as potential outliers.
+  const outlierThreshold = 3 * res.rms;
   let html = '<table><thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+  let outlierCount = 0;
   for (const r of res.rows) {
-    html += '<tr>';
-    html += `<td>${r.name}</td>`;
+    const isOutlier = r.errMag > outlierThreshold;
+    if (isOutlier) outlierCount++;
+    html += `<tr${isOutlier ? ' class="outlier"' : ''}>`;
+    html += `<td>${r.name}${isOutlier ? ' ⚠' : ''}</td>`;
     html += `<td>${r.predicted[0].toFixed(3)}</td><td>${r.predicted[1].toFixed(3)}</td><td>${r.predicted[2].toFixed(3)}</td>`;
     html += `<td>${r.actual[0].toFixed(3)}</td><td>${r.actual[1].toFixed(3)}</td><td>${r.actual[2].toFixed(3)}</td>`;
     html += `<td>${r.error[0].toFixed(3)}</td><td>${r.error[1].toFixed(3)}</td><td>${r.error[2].toFixed(3)}</td>`;
@@ -875,6 +882,9 @@ function renderResiduals(res) {
     html += '</tr>';
   }
   html += `<tr><td colspan="10" style="text-align:right;"><strong>RMS Error (mm):</strong></td><td><strong>${res.rms.toFixed(3)}</strong></td></tr>`;
+  if (outlierCount > 0) {
+    html += `<tr><td colspan="11" style="text-align:left; color:#b00020;">⚠ ${outlierCount} row(s) flagged: |error| &gt; 3×RMS — possible measurement outlier.</td></tr>`;
+  }
   html += '</tbody></table>';
   container.innerHTML = html;
   panel.classList.remove('hidden');
