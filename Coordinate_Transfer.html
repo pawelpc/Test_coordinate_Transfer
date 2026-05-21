@@ -490,6 +490,26 @@ function computeMachineGRotation(R) {
   return [XG, YG, ZGn]; // rows
 }
 
+// ============================================================
+// Cylindrical conversions
+// ============================================================
+// Machine (X, Y, Z) -> MachineP (RP, AP, YP)
+//   RP = sqrt(X² + Z²)
+//   AP = atan2(Z, X) in degrees
+//   YP = Y
+function toMachineP(x, y, z) {
+  const RP = Math.sqrt(x * x + z * z);
+  const AP = Math.atan2(z, x) * (180 / Math.PI);
+  return { RP, AP, YP: y };
+}
+
+// MachineG (XG, YG, ZG) -> MachinePG (RPG, APG, YPG)
+function toMachinePG(xg, yg, zg) {
+  const RPG = Math.sqrt(xg * xg + zg * zg);
+  const APG = Math.atan2(zg, xg) * (180 / Math.PI);
+  return { RPG, APG, YPG: yg };
+}
+
 function cross3(a, b) {
   return [
     a[1] * b[2] - a[2] * b[1],
