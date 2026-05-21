@@ -463,6 +463,41 @@ function applySimilarity(s, R, t, p) {
   return [s * Rp[0] + t[0], s * Rp[1] + t[1], s * Rp[2] + t[2]];
 }
 
+// ============================================================
+// Machine -> MachineG rotation
+// ============================================================
+// Derives the rotation matrix R_MG such that  P_machineG = R_MG · P_machine.
+// YG is gravity-aligned (parallel to Global Elevation, expressed in Machine
+// frame). XG is the front-of-machine direction projected onto the horizontal
+// plane (perpendicular to YG). ZG = XG × YG completes a right-handed frame.
+// The rows of R_MG are XG, YG, ZG expressed in the Machine basis.
+function computeMachineGRotation(R) {
+  // Global Elevation direction is [0, 0, 1]; transform to Machine frame.
+  const e_elev = [0, 0, 1];
+  let YG = matVec(R, e_elev);                    // already unit-length (R is orthogonal)
+  YG = normaliseVec(YG);                         // defensive renormalisation
+
+  // Machine front direction is +X = [1, 0, 0]
+  const e_front = [1, 0, 0];
+  const dot = e_front[0] * YG[0] + e_front[1] * YG[1] + e_front[2] * YG[2];
+  let XG = [e_front[0] - dot * YG[0], e_front[1] - dot * YG[1], e_front[2] - dot * YG[2]];
+  XG = normaliseVec(XG);
+
+  // ZG = XG × YG
+  const ZG = cross3(XG, YG);
+  const ZGn = normaliseVec(ZG);  // should already be unit-length
+
+  return [XG, YG, ZGn]; // rows
+}
+
+function cross3(a, b) {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0]
+  ];
+}
+
 // Compute residuals per calibration point.
 // Returns array of { name, predicted: [x,y,z], actual: [x,y,z], error: [dx,dy,dz], errMag } and an rms summary.
 function computeResiduals(s, R, t, globalPts, machinePts, labels) {
