@@ -685,7 +685,9 @@ function formatOutputCSV(parsed, results) {
 
   // ---- Stage 2 ----
   lines.push('=== STAGE 2: TRANSFORMED DATA ===');
-  lines.push(csvRow(['Measurement Columns:', ...stage2.colLabels]));
+  // Blank cell B keeps the column headers aligned with the per-point data
+  // rows below, which use cols A,B for (name, axis) and start values at C.
+  lines.push(csvRow(['Measurement Columns:', '', ...stage2.colLabels]));
   lines.push('');
 
   for (const pt of stage2.points) {
