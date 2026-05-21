@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Coordinate Transfer Tool</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/12.4.0/math.min.js"></script>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 1100px; margin: 24px auto; padding: 0 16px; color: #1f2933; }
+  h1 { margin-bottom: 4px; }
+  .subtitle { color: #52606d; margin-top: 0; }
+  #dropZone { border: 2px dashed #9aa5b1; border-radius: 8px; padding: 32px; text-align: center; color: #52606d; cursor: pointer; transition: background 0.2s, border-color 0.2s; }
+  #dropZone.dragover { background: #e3f2fd; border-color: #1976d2; color: #1976d2; }
+  .controls { margin: 16px 0; display: flex; gap: 12px; align-items: center; }
+  button { padding: 8px 18px; border: none; border-radius: 6px; background: #1976d2; color: white; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #cbd2d9; cursor: not-allowed; }
+  button:hover:not(:disabled) { background: #1565c0; }
+  #status { background: #f5f7fa; border-left: 4px solid #1976d2; padding: 12px 16px; min-height: 24px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; white-space: pre-wrap; max-height: 240px; overflow-y: auto; }
+  #status .err { color: #b00020; }
+  #status .ok { color: #1b8a3a; }
+  .panel { margin-top: 24px; padding: 16px; border: 1px solid #e4e7eb; border-radius: 8px; }
+  .panel h2 { margin-top: 0; font-size: 17px; color: #243b53; }
+  .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .summary-item { background: #f5f7fa; padding: 10px 12px; border-radius: 6px; }
+  .summary-item .label { font-size: 12px; color: #52606d; text-transform: uppercase; }
+  .summary-item .value { font-size: 18px; font-weight: 600; color: #1f2933; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; font-family: 'Consolas', 'Courier New', monospace; }
+  th, td { border: 1px solid #cbd2d9; padding: 4px 8px; text-align: right; }
+  th { background: #f0f4f8; }
+  td:first-child, th:first-child { text-align: left; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Coordinate Transfer Tool</h1>
+<p class="subtitle">Transforms machine test data between Global, Machine, MachineG, MachineP, and MachinePG coordinate systems.</p>
+
+<div id="dropZone">
+  <strong>Drop a CSV here</strong> or click to choose a file
+  <div style="font-size: 12px; margin-top: 6px;">Expected format: Stage 1 calibration block + Stage 2 test data, separated by a `----------` row.</div>
+</div>
+<input type="file" id="fileInput" accept=".csv" hidden>
+
+<div class="controls">
+  <button id="processBtn" disabled>Process</button>
+  <button id="downloadBtn" disabled>Download Output CSV</button>
+  <span id="fileName" style="color: #52606d; font-size: 13px;"></span>
+</div>
+
+<div id="status">Awaiting input file...</div>
+
+<div id="summaryPanel" class="panel hidden">
+  <h2>Summary</h2>
+  <div class="summary-grid" id="summaryGrid"></div>
+</div>
+
+<div id="residualsPanel" class="panel hidden">
+  <h2>Calibration Residuals</h2>
+  <div id="residualsTable"></div>
+</div>
+
+<script>
+'use strict';
+
+// ============================================================
+// State
+// ============================================================
+let g_file = null;          // currently loaded File object
+let g_csvText = null;       // raw CSV text
+let g_parsed = null;        // parsed input structure
+let g_results = null;       // computed results
+let g_outputCsv = null;     // final output CSV string
+
+// ============================================================
+// Status logging
+// ============================================================
+function logStatus(msg, kind) {
+  const el = document.getElementById('status');
+  const line = document.createElement('div');
+  if (kind) line.className = kind;
+  line.textContent = msg;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function clearStatus() {
+  document.getElementById('status').innerHTML = '';
+}
+
+// ============================================================
+// CSV parsing
+// ============================================================
+// Simple CSV row split. The example file does not use quoted strings, but
+// guard against them anyway.
+function splitCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') { inQuotes = false; }
+      else { cur += ch; }
+    } else {
+      if (ch === '"') { inQuotes = true; }
+      else if (ch === ',') { out.push(cur); cur = ''; }
+      else { cur += ch; }
+    }
+  }
+  out.push(cur);
+  return out.map(s => s.trim());
+}
+
+function isSeparatorRow(cells) {
+  // All non-empty cells are "----------"
+  const nonEmpty = cells.filter(c => c.length > 0);
+  return nonEmpty.length > 0 && nonEmpty.every(c => c === '----------');
+}
+
+function isBlankRow(cells) {
+  return cells.every(c => c === '');
+}
+
+// Take a numeric-data row: skip first two columns (point id, axis label) and
+// parse the remaining cells as floats until we hit an empty cell.
+function parseNumericRow(cells) {
+  const out = [];
+  for (let i = 2; i < cells.length; i++) {
+    const v = cells[i];
+    if (v === '' || v === undefined) break;
+    const n = Number(v);
+    if (Number.isNaN(n)) throw new Error(`Non-numeric value "${v}" in data row`);
+    out.push(n);
+  }
+  return out;
+}
+
+// Take a column-label row (e.g. point id,,c1,c2,..,c9): return the labels
+// from column 2 onward, stopping at the first empty.
+function parseColumnLabels(cells) {
+  const out = [];
+  for (let i = 2; i < cells.length; i++) {
+    const v = cells[i];
+    if (v === '' || v === undefined) break;
+    out.push(v);
+  }
+  return out;
+}
+
+// parseCSV(text) -> {
+//   runLabel,
+//   stage1: { uts: { name, east[], north[], elev[] }, machine: { name, x[], y[], z[] }, colLabels },
+//   stage2: { uts: { name, east[], north[], elev[] }, machinePoints: [{ name, x[], y[], z[] }], colLabels }
+// }
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).map(splitCsvLine);
+
+  // Locate the separator row
+  let sepIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (isSeparatorRow(lines[i])) { sepIdx = i; break; }
+  }
+  if (sepIdx === -1) throw new Error('Could not find Stage 1 / Stage 2 separator row (all "----------").');
+
+  const runLabel = (lines[0] && lines[0][0]) ? lines[0][0] : '';
+
+  const stage1 = parseStageBlock(lines, 0, sepIdx, 'Stage 1');
+  const stage2 = parseStageBlock(lines, sepIdx + 1, lines.length, 'Stage 2');
+
+  // Validate Stage 1: exactly 1 UTS point + 1 machine point
+  if (stage1.utsPoints.length !== 1) throw new Error(`Stage 1 expected 1 UTS point, got ${stage1.utsPoints.length}`);
+  if (stage1.machinePoints.length !== 1) throw new Error(`Stage 1 expected 1 Machine point, got ${stage1.machinePoints.length}`);
+  // Validate Stage 2: exactly 1 UTS point + >=1 machine point
+  if (stage2.utsPoints.length !== 1) throw new Error(`Stage 2 expected 1 UTS point, got ${stage2.utsPoints.length}`);
+  if (stage2.machinePoints.length < 1) throw new Error('Stage 2 has no machine points');
+
+  return {
+    runLabel,
+    stage1: {
+      uts: stage1.utsPoints[0],
+      machine: stage1.machinePoints[0],
+      colLabels: stage1.colLabels
+    },
+    stage2: {
+      uts: stage2.utsPoints[0],
+      machinePoints: stage2.machinePoints,
+      colLabels: stage2.colLabels
+    }
+  };
+}
+
+// Parse a block of rows from `start` (inclusive) to `end` (exclusive). The
+// block contains UTS section + Machine section, each preceded by a header
+// like "-- ... UTS DATA --" or "-- ... Machine DATA --", and the UTS section
+// is preceded by a "point id,,c1,c2,..." column-labels row.
+function parseStageBlock(lines, start, end, stageName) {
+  let utsHeaderIdx = -1;
+  let machineHeaderIdx = -1;
+  for (let i = start; i < end; i++) {
+    const row = lines[i];
+    if (row.length === 0) continue;
+    const cell0 = row[0] || '';
+    if (/UTS DATA/i.test(cell0)) utsHeaderIdx = i;
+    else if (/Machine DATA/i.test(cell0)) machineHeaderIdx = i;
+  }
+  if (utsHeaderIdx === -1) throw new Error(`${stageName}: missing UTS DATA header`);
+  if (machineHeaderIdx === -1) throw new Error(`${stageName}: missing Machine DATA header`);
+  if (machineHeaderIdx < utsHeaderIdx) throw new Error(`${stageName}: Machine header appears before UTS header`);
+
+  // Column labels row: first non-blank row after UTS header whose first cell
+  // is "point id" (or "Point id").
+  let colLabels = [];
+  let utsDataStart = utsHeaderIdx + 1;
+  for (let i = utsHeaderIdx + 1; i < machineHeaderIdx; i++) {
+    const row = lines[i];
+    if (isBlankRow(row)) continue;
+    if (/^point id$/i.test(row[0] || '')) {
+      colLabels = parseColumnLabels(row);
+      utsDataStart = i + 1;
+      break;
+    }
+  }
+  if (colLabels.length === 0) throw new Error(`${stageName}: could not find column labels row`);
+
+  // Parse axis-labelled rows in [utsDataStart, machineHeaderIdx) as UTS data
+  const utsPoints = parsePointRows(lines, utsDataStart, machineHeaderIdx, colLabels.length, stageName + ' UTS');
+  // Parse axis-labelled rows in (machineHeaderIdx, end) as Machine data
+  const machinePoints = parsePointRows(lines, machineHeaderIdx + 1, end, colLabels.length, stageName + ' Machine');
+
+  return { colLabels, utsPoints, machinePoints };
+}
+
+// Parse a contiguous run of axis-labelled rows. Each point has 3 rows
+// (axes 0, 1, 2) which are East/North/Elevation for UTS or X/Y/Z for Machine.
+// Returns an array of { name, east?[], north?[], elev?[], x?[], y?[], z?[] }
+// depending on the axis labels seen — but normalises into both shapes:
+//   { name, axes: [arr0, arr1, arr2], east/north/elev or x/y/z aliases }
+function parsePointRows(lines, start, end, expectedCols, label) {
+  const points = [];
+  let currentName = null;
+  let currentAxes = [];
+
+  for (let i = start; i < end; i++) {
+    const row = lines[i];
+    if (isBlankRow(row)) continue;
+    if (isSeparatorRow(row)) continue;
+    const name = row[0] || '';
+    const axis = (row[1] || '').trim();
+    if (!name || !axis) continue;
+    // Skip rows that aren't axis-labelled (defensive)
+    if (!/^(East|North|Elevation|X|Y|Z)$/i.test(axis)) continue;
+    const values = parseNumericRow(row);
+    if (values.length !== expectedCols) {
+      throw new Error(`${label}: row "${name},${axis}" has ${values.length} values, expected ${expectedCols}`);
+    }
+
+    if (currentName === null || name !== currentName) {
+      if (currentName !== null) {
+        points.push(finalisePoint(currentName, currentAxes, label));
+      }
+      currentName = name;
+      currentAxes = [];
+    }
+    currentAxes.push({ axis, values });
+  }
+  if (currentName !== null) {
+    points.push(finalisePoint(currentName, currentAxes, label));
+  }
+  return points;
+}
+
+function finalisePoint(name, axes, label) {
+  if (axes.length !== 3) {
+    throw new Error(`${label}: point "${name}" has ${axes.length} axis rows, expected 3`);
+  }
+  const pt = { name };
+  for (const { axis, values } of axes) {
+    const key = axis.toLowerCase();
+    // Map full names to shorter keys
+    const k = key === 'elevation' ? 'elev' : key; // east, north, elev, x, y, z
+    pt[k] = values;
+  }
+  return pt;
+}
+
+// ============================================================
+// File handling / UI plumbing
+// ============================================================
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const processBtn = document.getElementById('processBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const fileNameEl = document.getElementById('fileName');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length > 0) loadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files.length > 0) loadFile(e.target.files[0]);
+});
+processBtn.addEventListener('click', runProcessing);
+downloadBtn.addEventListener('click', downloadOutput);
+
+function loadFile(file) {
+  g_file = file;
+  fileNameEl.textContent = file.name;
+  clearStatus();
+  logStatus(`Loading "${file.name}" (${file.size} bytes)...`);
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    g_csvText = e.target.result;
+    logStatus(`File read: ${g_csvText.length} characters`, 'ok');
+    try {
+      g_parsed = parseCSV(g_csvText);
+      logParsed(g_parsed);
+      processBtn.disabled = false;
+      downloadBtn.disabled = true;
+    } catch (err) {
+      logStatus('Parse error: ' + err.message, 'err');
+      processBtn.disabled = true;
+    }
+  };
+  reader.onerror = () => logStatus('Failed to read file', 'err');
+  reader.readAsText(file);
+}
+
+function logParsed(p) {
+  logStatus(`Run label: ${p.runLabel}`);
+  logStatus(`Stage 1: ${p.stage1.colLabels.length} calibration points (${p.stage1.colLabels.join(', ')})`);
+  logStatus(`  UTS point: "${p.stage1.uts.name}" — east/north/elev arrays length ${p.stage1.uts.east.length}`);
+  logStatus(`  Machine point: "${p.stage1.machine.name}" — x/y/z arrays length ${p.stage1.machine.x.length}`);
+  logStatus(`Stage 2: ${p.stage2.colLabels.length} measurement columns (${p.stage2.colLabels[0]}..${p.stage2.colLabels[p.stage2.colLabels.length - 1]})`);
+  logStatus(`  UTS point: "${p.stage2.uts.name}" — length ${p.stage2.uts.east.length}`);
+  logStatus(`  Machine points (${p.stage2.machinePoints.length}):`);
+  for (const mp of p.stage2.machinePoints) {
+    logStatus(`    - "${mp.name}" (${mp.x.length} columns)`);
+  }
+  logStatus('Parse OK.', 'ok');
+}
+
+// ============================================================
+// Processing (placeholder — will be filled in later milestones)
+// ============================================================
+function runProcessing() {
+  logStatus('Processing not yet implemented in this milestone.', 'err');
+}
+
+function downloadOutput() {
+  if (!g_outputCsv) return;
+  const base = g_file.name.replace(/\.csv$/i, '');
+  const filename = `${base}_OUTPUT.csv`;
+  const blob = new Blob([g_outputCsv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
