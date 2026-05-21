@@ -536,6 +536,74 @@ function computeResiduals(s, R, t, globalPts, machinePts, labels) {
 }
 
 // ============================================================
+// Stage 2 transformation pipeline
+// ============================================================
+// Given the calibration (s, R, t, R_MG) and the parsed Stage 2 data, compute
+// every coordinate-system representation for every point and every column.
+//
+// Output shape:
+// {
+//   colLabels: [...],
+//   points: [
+//     { name, isUTS,
+//       X:[], Y:[], Z:[],
+//       XG:[], YG:[], ZG:[],
+//       RP:[], AP:[], YP:[],
+//       RPG:[], APG:[], YPG:[]
+//     }, ...
+//   ]
+// }
+function transformStage2(stage2, sim, R_MG) {
+  const ncol = stage2.colLabels.length;
+  const points = [];
+
+  // 1) UTS-J: transform meters -> Machine mm via the similarity transform
+  const utsPoint = makeEmptyPoint(stage2.uts.name, true, ncol);
+  for (let i = 0; i < ncol; i++) {
+    const pGlobal = [stage2.uts.east[i], stage2.uts.north[i], stage2.uts.elev[i]];
+    const pMachine = applySimilarity(sim.s, sim.R, sim.t, pGlobal);
+    fillAllSystemsForColumn(utsPoint, R_MG, i, pMachine[0], pMachine[1], pMachine[2]);
+  }
+  points.push(utsPoint);
+
+  // 2) Each Machine point: already in Machine coords
+  for (const mp of stage2.machinePoints) {
+    const pt = makeEmptyPoint(mp.name, false, ncol);
+    for (let i = 0; i < ncol; i++) {
+      fillAllSystemsForColumn(pt, R_MG, i, mp.x[i], mp.y[i], mp.z[i]);
+    }
+    points.push(pt);
+  }
+
+  return { colLabels: stage2.colLabels.slice(), points };
+}
+
+function makeEmptyPoint(name, isUTS, n) {
+  return {
+    name, isUTS,
+    X: new Array(n), Y: new Array(n), Z: new Array(n),
+    XG: new Array(n), YG: new Array(n), ZG: new Array(n),
+    RP: new Array(n), AP: new Array(n), YP: new Array(n),
+    RPG: new Array(n), APG: new Array(n), YPG: new Array(n)
+  };
+}
+
+// Fill column i of `pt` with all 5 coordinate-system representations of
+// the Machine-frame point (x, y, z).
+function fillAllSystemsForColumn(pt, R_MG, i, x, y, z) {
+  pt.X[i] = x; pt.Y[i] = y; pt.Z[i] = z;
+
+  const pG = matVec(R_MG, [x, y, z]);
+  pt.XG[i] = pG[0]; pt.YG[i] = pG[1]; pt.ZG[i] = pG[2];
+
+  const mp = toMachineP(x, y, z);
+  pt.RP[i] = mp.RP; pt.AP[i] = mp.AP; pt.YP[i] = mp.YP;
+
+  const mpg = toMachinePG(pG[0], pG[1], pG[2]);
+  pt.RPG[i] = mpg.RPG; pt.APG[i] = mpg.APG; pt.YPG[i] = mpg.YPG;
+}
+
+// ============================================================
 // File handling / UI plumbing
 // ============================================================
 const dropZone = document.getElementById('dropZone');
