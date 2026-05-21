@@ -770,7 +770,7 @@ function runProcessing() {
   try {
     const p = g_parsed;
 
-    // Build calibration point lists (Global in meters, Machine in mm)
+    // ----- Stage 1: similarity transform -----
     const n = p.stage1.colLabels.length;
     const globalPts = [], machinePts = [];
     for (let i = 0; i < n; i++) {
@@ -780,25 +780,104 @@ function runProcessing() {
 
     logStatus(`Computing similarity transform from ${n} calibration points...`);
     const sim = computeSimilarityTransform(globalPts, machinePts);
-    logStatus(`Scale factor s = ${sim.s.toFixed(6)} (expected ≈ 1000)`, 'ok');
-    logStatus(`Rotation R (rows):`);
-    logStatus(`  [${sim.R[0].map(v => v.toFixed(6)).join(', ')}]`);
-    logStatus(`  [${sim.R[1].map(v => v.toFixed(6)).join(', ')}]`);
-    logStatus(`  [${sim.R[2].map(v => v.toFixed(6)).join(', ')}]`);
+    logStatus(`Scale factor s = ${sim.s.toFixed(6)} mm/m (expected ≈ 1000)`, 'ok');
     logStatus(`det(R) = ${det3(sim.R).toFixed(6)} (should be +1)`);
     logStatus(`Translation t = [${sim.t.map(v => v.toFixed(3)).join(', ')}] mm`);
 
+    // ----- Residuals -----
     const res = computeResiduals(sim.s, sim.R, sim.t, globalPts, machinePts, p.stage1.colLabels);
-    logStatus(`RMS residual: ${res.rms.toFixed(3)} mm  (max ${Math.max(...res.rows.map(r => r.errMag)).toFixed(3)})`, 'ok');
-    for (const r of res.rows) {
-      logStatus(`  ${r.name}: err = ${r.errMag.toFixed(3)} mm`);
-    }
+    logStatus(`RMS residual: ${res.rms.toFixed(3)} mm  (max ${Math.max(...res.rows.map(r => r.errMag)).toFixed(3)} mm)`, 'ok');
 
-    g_results = { sim, residuals: res };
+    // ----- MachineG rotation -----
+    const R_MG = computeMachineGRotation(sim.R);
+    logStatus(`MachineG rotation derived. YG (Machine frame) = [${R_MG[1].map(v => v.toFixed(4)).join(', ')}]`);
+
+    // ----- Sanity check: YG deltas vs Elevation*1000 deltas for calibration points -----
+    // Compute YG for each Machine calibration point (Point J Prime), compare deltas to (Elevation * 1000) deltas.
+    const ygCal = [];
+    const elevCal = [];
+    for (let i = 0; i < n; i++) {
+      const m = machinePts[i];
+      const pG = matVec(R_MG, m);
+      ygCal.push(pG[1]);
+      elevCal.push(globalPts[i][2] * 1000);  // meters -> mm
+    }
+    // Compare deltas relative to point 0
+    let maxDeltaErr = 0;
+    for (let i = 1; i < n; i++) {
+      const dYG = ygCal[i] - ygCal[0];
+      const dElev = elevCal[i] - elevCal[0];
+      const err = Math.abs(dYG - dElev);
+      if (err > maxDeltaErr) maxDeltaErr = err;
+    }
+    logStatus(`Sanity: max |ΔYG − ΔElevation·1000| over calibration points = ${maxDeltaErr.toFixed(3)} mm`);
+
+    // ----- Stage 2 transformations -----
+    logStatus(`Transforming Stage 2: ${p.stage2.colLabels.length} columns × ${p.stage2.machinePoints.length + 1} points (incl. UTS-J)...`);
+    const stage2 = transformStage2(p.stage2, sim, R_MG);
+    logStatus(`Stage 2 complete: ${stage2.points.length} points, all 5 coordinate systems.`, 'ok');
+
+    g_results = { sim, R_MG, residuals: res, stage2 };
+
+    // ----- Format output CSV -----
+    g_outputCsv = formatOutputCSV(p, g_results);
+    logStatus(`Output CSV ready (${g_outputCsv.length} chars). Click Download to save.`, 'ok');
+
+    // ----- Render UI panels -----
+    renderSummary(p, g_results);
+    renderResiduals(g_results.residuals);
+
+    downloadBtn.disabled = false;
   } catch (err) {
     logStatus('Processing error: ' + err.message, 'err');
     console.error(err);
   }
+}
+
+function renderSummary(parsed, results) {
+  const panel = document.getElementById('summaryPanel');
+  const grid = document.getElementById('summaryGrid');
+  grid.innerHTML = '';
+  const items = [
+    ['Run', parsed.runLabel],
+    ['Calibration Points', parsed.stage1.colLabels.length],
+    ['Scale Factor', results.sim.s.toFixed(4) + '  (m → mm)'],
+    ['RMS Residual', results.residuals.rms.toFixed(3) + ' mm'],
+    ['Max Residual', Math.max(...results.residuals.rows.map(r => r.errMag)).toFixed(3) + ' mm'],
+    ['Stage 2 Columns', parsed.stage2.colLabels.length],
+    ['Stage 2 Points', results.stage2.points.length + '  (incl. UTS-J)']
+  ];
+  for (const [label, value] of items) {
+    const div = document.createElement('div');
+    div.className = 'summary-item';
+    div.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`;
+    grid.appendChild(div);
+  }
+  panel.classList.remove('hidden');
+}
+
+function renderResiduals(res) {
+  const panel = document.getElementById('residualsPanel');
+  const container = document.getElementById('residualsTable');
+  const headers = ['Point',
+    'Pred X', 'Pred Y', 'Pred Z',
+    'Actual X', 'Actual Y', 'Actual Z',
+    'Err X', 'Err Y', 'Err Z',
+    '|Err| (mm)'];
+  let html = '<table><thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+  for (const r of res.rows) {
+    html += '<tr>';
+    html += `<td>${r.name}</td>`;
+    html += `<td>${r.predicted[0].toFixed(3)}</td><td>${r.predicted[1].toFixed(3)}</td><td>${r.predicted[2].toFixed(3)}</td>`;
+    html += `<td>${r.actual[0].toFixed(3)}</td><td>${r.actual[1].toFixed(3)}</td><td>${r.actual[2].toFixed(3)}</td>`;
+    html += `<td>${r.error[0].toFixed(3)}</td><td>${r.error[1].toFixed(3)}</td><td>${r.error[2].toFixed(3)}</td>`;
+    html += `<td><strong>${r.errMag.toFixed(3)}</strong></td>`;
+    html += '</tr>';
+  }
+  html += `<tr><td colspan="10" style="text-align:right;"><strong>RMS Error (mm):</strong></td><td><strong>${res.rms.toFixed(3)}</strong></td></tr>`;
+  html += '</tbody></table>';
+  container.innerHTML = html;
+  panel.classList.remove('hidden');
 }
 
 function downloadOutput() {
