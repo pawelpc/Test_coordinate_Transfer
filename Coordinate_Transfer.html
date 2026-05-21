@@ -604,6 +604,105 @@ function fillAllSystemsForColumn(pt, R_MG, i, x, y, z) {
 }
 
 // ============================================================
+// Output CSV formatting
+// ============================================================
+// Format a number to 6 significant figures, trimming trailing zeros.
+function fmt(x) {
+  if (x === null || x === undefined || Number.isNaN(x)) return '';
+  if (!Number.isFinite(x)) return x.toString();
+  if (x === 0) return '0';
+  return Number(x.toPrecision(6)).toString();
+}
+
+// Escape a CSV cell value (only quote if it contains special chars).
+function csvCell(v) {
+  const s = (v === null || v === undefined) ? '' : String(v);
+  if (/[,"\n\r]/.test(s)) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function csvRow(cells) {
+  return cells.map(csvCell).join(',');
+}
+
+// Build the full output CSV string.
+function formatOutputCSV(parsed, results) {
+  const sim = results.sim;
+  const R_MG = results.R_MG;
+  const res = results.residuals;
+  const stage2 = results.stage2;
+  const lines = [];
+
+  // ---- Stage 1 ----
+  lines.push('=== STAGE 1: CALIBRATION ===');
+  lines.push(csvRow(['Run:', parsed.runLabel]));
+  lines.push(csvRow(['Calibration Points:', parsed.stage1.colLabels.length]));
+  lines.push('');
+
+  lines.push('--- Global to Machine Similarity Transform ---');
+  lines.push(csvRow(['Scale Factor:', fmt(sim.s)]));
+  lines.push(csvRow(['Units:', 'meters to mm']));
+  lines.push('');
+
+  lines.push('Rotation Matrix R:');
+  lines.push(csvRow(['', 'col1', 'col2', 'col3']));
+  for (let i = 0; i < 3; i++) {
+    lines.push(csvRow([`row${i+1}`, fmt(sim.R[i][0]), fmt(sim.R[i][1]), fmt(sim.R[i][2])]));
+  }
+  lines.push('');
+
+  lines.push('Translation Vector t (mm):');
+  lines.push(csvRow(['tX', fmt(sim.t[0])]));
+  lines.push(csvRow(['tY', fmt(sim.t[1])]));
+  lines.push(csvRow(['tZ', fmt(sim.t[2])]));
+  lines.push('');
+
+  lines.push('--- Machine to MachineG Rotation ---');
+  lines.push('Rotation Matrix R_MG:');
+  lines.push(csvRow(['', 'col1', 'col2', 'col3']));
+  for (let i = 0; i < 3; i++) {
+    lines.push(csvRow([`row${i+1}`, fmt(R_MG[i][0]), fmt(R_MG[i][1]), fmt(R_MG[i][2])]));
+  }
+  lines.push('');
+
+  lines.push('--- Calibration Residuals ---');
+  lines.push(csvRow(['Point', 'Predicted X', 'Predicted Y', 'Predicted Z',
+                     'Actual X', 'Actual Y', 'Actual Z',
+                     'Error X', 'Error Y', 'Error Z', 'Error Magnitude (mm)']));
+  for (const r of res.rows) {
+    lines.push(csvRow([r.name,
+      fmt(r.predicted[0]), fmt(r.predicted[1]), fmt(r.predicted[2]),
+      fmt(r.actual[0]), fmt(r.actual[1]), fmt(r.actual[2]),
+      fmt(r.error[0]), fmt(r.error[1]), fmt(r.error[2]),
+      fmt(r.errMag)]));
+  }
+  lines.push(csvRow(['RMS Error (mm):', fmt(res.rms)]));
+  lines.push('');
+
+  // ---- Stage 2 ----
+  lines.push('=== STAGE 2: TRANSFORMED DATA ===');
+  lines.push(csvRow(['Measurement Columns:', ...stage2.colLabels]));
+  lines.push('');
+
+  for (const pt of stage2.points) {
+    const header = pt.isUTS
+      ? `--- ${pt.name} (transformed from Global to Machine) ---`
+      : `--- ${pt.name} ---`;
+    lines.push(header);
+
+    const axes = ['X', 'Y', 'Z', 'XG', 'YG', 'ZG', 'RP', 'AP', 'YP', 'RPG', 'APG', 'YPG'];
+    for (const ax of axes) {
+      lines.push(csvRow([pt.name, ax, ...pt[ax].map(fmt)]));
+    }
+    lines.push('');
+  }
+
+  return lines.join('\r\n');
+}
+
+// ============================================================
 // File handling / UI plumbing
 // ============================================================
 const dropZone = document.getElementById('dropZone');
